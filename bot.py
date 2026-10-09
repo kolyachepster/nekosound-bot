@@ -40,7 +40,7 @@ import json
 try:
     FIREBASE_KEY_JSON = os.getenv('FIREBASE_KEY_JSON')
     if FIREBASE_KEY_JSON:
-        
+          
         cred = credentials.Certificate(json.loads(FIREBASE_KEY_JSON))
     else:
         
