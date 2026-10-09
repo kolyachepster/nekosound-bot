@@ -26,7 +26,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # ============================================================
-#  FIREBASE (инициализация один раз)
+#  FIREBASE
 # ============================================================
 db = None
 
@@ -46,6 +46,44 @@ def init_firebase():
         logger.error(f'❌ Ошибка Firebase: {e}')
     
     return db
+
+# ============================================================
+#  СОСТОЯНИЕ ПОЛЬЗОВАТЕЛЯ (в Firestore)
+# ============================================================
+def get_state(user_id):
+    """Получить состояние пользователя."""
+    db = init_firebase()
+    if not db:
+        return {}
+    try:
+        doc = db.collection('botStates').document(str(user_id)).get()
+        return doc.to_dict() if doc.exists else {}
+    except Exception as e:
+        logger.error(f'Ошибка get_state: {e}')
+        return {}
+
+def set_state(user_id, state, extra=None):
+    """Сохранить состояние пользователя."""
+    db = init_firebase()
+    if not db:
+        return
+    try:
+        data = {'state': state, 'updatedAt': firestore.SERVER_TIMESTAMP}
+        if extra:
+            data.update(extra)
+        db.collection('botStates').document(str(user_id)).set(data, merge=True)
+    except Exception as e:
+        logger.error(f'Ошибка set_state: {e}')
+
+def clear_state(user_id):
+    """Очистить состояние пользователя."""
+    db = init_firebase()
+    if not db:
+        return
+    try:
+        db.collection('botStates').document(str(user_id)).delete()
+    except Exception as e:
+        logger.error(f'Ошибка clear_state: {e}')
 
 # ============================================================
 #  КЛАВИАТУРЫ
@@ -82,6 +120,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         order_id = args[0].replace('order_', '')
         await show_order_from_site(update, context, order_id)
         return
+
+    clear_state(user.id)
 
     welcome = (
         f"Привет, {user.first_name}! 🐱🎙️\n\n"
@@ -132,7 +172,7 @@ async def show_order_from_site(update: Update, context: ContextTypes.DEFAULT_TYP
             reply_markup=confirm_keyboard(order_id),
             parse_mode='HTML'
         )
-        context.user_data['order_id'] = order_id
+        set_state(update.effective_user.id, 'awaiting_confirm', {'order_id': order_id})
 
     except Exception as e:
         logger.error(f'Ошибка загрузки заказа: {e}')
@@ -145,6 +185,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     data = query.data
+    user_id = query.from_user.id
 
     if data == "order":
         await query.edit_message_text(
@@ -158,7 +199,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=cancel_keyboard(),
             parse_mode='HTML'
         )
-        context.user_data['state'] = 'ordering'
+        set_state(user_id, 'ordering')
 
     elif data == "suggest":
         await query.edit_message_text(
@@ -170,7 +211,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=cancel_keyboard(),
             parse_mode='HTML'
         )
-        context.user_data['state'] = 'suggesting'
+        set_state(user_id, 'suggesting')
 
     elif data == "price":
         await query.edit_message_text(
@@ -188,13 +229,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "📞 <b>Связаться с нами</b>\n\n"
             "Telegram: @nekosoundstudio\n"
             "TikTok: @nekosound_studio\n"
-            "Email: nekosoundstudio@gmail.com",
+            "Email: nekosoftstudio@gmail.com",
             reply_markup=main_menu_keyboard(),
             parse_mode='HTML'
         )
 
     elif data == "cancel":
-        context.user_data['state'] = None
+        clear_state(user_id)
         await query.edit_message_text("❌ Действие отменено.", reply_markup=main_menu_keyboard())
 
     elif data.startswith("confirm_"):
@@ -212,8 +253,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=cancel_keyboard(),
             parse_mode='HTML'
         )
-        context.user_data['state'] = 'editing'
-        context.user_data['edit_order_id'] = order_id
+        set_state(user_id, 'editing', {'order_id': order_id})
 
 # ============================================================
 #  ПОДТВЕРЖДЕНИЕ / ОТМЕНА
@@ -248,6 +288,7 @@ async def confirm_order(query, context, order_id):
             except Exception as e:
                 logger.warning(f'Не удалось уведомить админа {admin_id}: {e}')
 
+        clear_state(query.from_user.id)
         await query.edit_message_text(
             "✅ <b>Спасибо! Заказ подтверждён.</b>\n\n"
             "Мы свяжемся с вами в ближайшее время.",
@@ -268,6 +309,7 @@ async def cancel_order(query, order_id):
             'status': 'cancelled',
             'cancelledAt': firestore.SERVER_TIMESTAMP
         })
+        clear_state(query.from_user.id)
         await query.edit_message_text(
             "❌ Заказ отменён.\n\nИспользуйте /start для нового заказа.",
             reply_markup=main_menu_keyboard()
@@ -283,7 +325,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db = init_firebase()
     user = update.effective_user
     text = update.message.text
-    state = context.user_data.get('state')
+    
+    # ✅ Читаем состояние из Firestore, а не из context
+    state_data = get_state(user.id)
+    state = state_data.get('state')
+
+    logger.info(f'User {user.id} state: {state}')
 
     if state == 'ordering':
         admin_text = (
@@ -312,7 +359,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception as e:
                 logger.error(f'Ошибка сохранения: {e}')
 
-        context.user_data['state'] = None
+        clear_state(user.id)
         await update.message.reply_text(
             "✅ <b>Спасибо! Заказ отправлен.</b>",
             reply_markup=main_menu_keyboard(),
@@ -346,7 +393,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception as e:
                 logger.error(f'Ошибка сохранения: {e}')
 
-        context.user_data['state'] = None
+        clear_state(user.id)
         await update.message.reply_text(
             "✅ <b>Спасибо! Предложение отправлено.</b>",
             reply_markup=main_menu_keyboard(),
@@ -354,7 +401,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     elif state == 'editing':
-        order_id = context.user_data.get('edit_order_id')
+        order_id = state_data.get('order_id')
         if db and order_id:
             try:
                 lines = text.strip().split('\n')
@@ -366,8 +413,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     'notes': lines[4] if len(lines) > 4 else '',
                     'updatedAt': firestore.SERVER_TIMESTAMP
                 })
-                context.user_data['state'] = None
-                context.user_data['edit_order_id'] = None
+                clear_state(user.id)
                 await update.message.reply_text("✅ Заказ обновлён!", reply_markup=main_menu_keyboard())
             except Exception as e:
                 logger.error(f'Ошибка редактирования: {e}')
@@ -380,7 +426,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 #  VERCEL HANDLER
 # ============================================================
 async def process_update(update_data):
-    """Обрабатывает одно обновление от Telegram."""
     if not BOT_TOKEN:
         logger.error('BOT_TOKEN не указан')
         return
@@ -416,7 +461,6 @@ class handler(BaseHTTPRequestHandler):
             self.end_headers()
 
     def do_GET(self):
-        """Для проверки работоспособности."""
         self.send_response(200)
         self.send_header('Content-Type', 'text/plain')
         self.end_headers()
